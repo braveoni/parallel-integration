@@ -1,5 +1,5 @@
-#include <cstdlib>
-#include <cstdio>
+#include <stdlib.h>
+#include <stdio.h>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -7,13 +7,12 @@
 #include <omp.h>
 #include <iostream>
 
-[[maybe_unused]] constexpr std::size_t CACHE_LINE = 64;
+
+constexpr std::size_t CACHE_LINE = 64;
 
 typedef float (*f_t) (float);
 
 #define n 10000000u
-
-void set_num_threads(unsigned T);
 
 std::atomic<unsigned> thread_num {std::thread::hardware_concurrency()};
 
@@ -34,20 +33,72 @@ typedef struct element_t_
 
 #include <memory>
 
-float integrate_omp(float a, float b, f_t f)
+float integrate_seq(float a, float b, f_t f)
+{
+    double res = 0.;
+    double dx = (b - a) / n;
+    for (size_t i = 0; i < n; ++i)
+        res += f((float) (dx * i + a));
+    return (float) (res * dx);
+}
+
+float integrate_omp_fs(float a, float b, f_t f) // сам стандарт при парал реализации
 {
     double dx = (b - a) / n;
-    std::unique_ptr<element_t[]> results;
+    double* results;
     double res = 0.0;
     unsigned T;
 #pragma omp parallel shared(results, T)
     {
-        auto t = (unsigned)omp_get_thread_num();
+        // t - индеф поток
+        unsigned t = (unsigned) omp_get_thread_num();
+#pragma omp single // выполняется одним потоком один раз
+        {
+            T = (unsigned) omp_get_num_threads();
+            results = (double*) calloc(sizeof(double), T); // массив у которого есть размер по памяти
+            // results = std::make_unique<element_t[]>(T);
+            if (!results)
+                abort();
+        }
+        for (size_t i = t; i < n; i += T)
+            results[t] += f((float) (dx * i + a));
+    }
+    for (size_t i = 0; i < T; ++i)
+        res += results[i];
+    free(results);
+    return (float) (res * dx);
+}
+
+#ifndef __cplusplus
+#ifdef _MSC_VER
+#define alignas(X) __declspec(align(X))
+#else
+#include <stdalign.h>
+#endif
+#endif
+#ifdef _MSC_VER
+#define aligned_alloc(alignment, size) _aligned_malloc((size), (alignment))
+#define aligned_free(ptr) _aligned_free(ptr)
+#else
+#define aligned_free(ptr) free(ptr)
+#endif
+
+#define CACHE_LINE 64u
+
+float integrate_omp(float a, float b, f_t f) // как cs, но с выравниванием
+{
+    double dx = (b - a) / n;
+    std::unique_ptr<element_t[]> results; // по окончании функции results уничтожится
+    double res = 0.0;
+    unsigned T;
+#pragma omp parallel shared(results, T)
+    {
+        unsigned t = (unsigned)omp_get_thread_num();
 #pragma omp single
         {
             T = (unsigned)get_num_threads();
-            results = std::make_unique<element_t[]>(T);
-        } //Барьер
+            results = std::make_unique<element_t[]>(T); // заполняет элемент
+        }
         results[t].value = 0.0;
         for (size_t i = t; i < n; i += T)
             results[t].value += f((float)(dx * i + a));
@@ -57,8 +108,90 @@ float integrate_omp(float a, float b, f_t f)
     return (float)(res * dx);
 }
 
-float integrate_cpp(float a, float b, f_t f)
+float integrate_omp_cs(float a, float b, f_t f)
 {
+    double res = 0.0;
+    double dx = (b - a) / n;
+#pragma omp parallel shared(res)
+    {
+        unsigned t = (unsigned) omp_get_thread_num();
+        unsigned T = (unsigned) omp_get_num_threads();
+        double value = 0.0;
+        for (size_t i = t; i < n; i += T)
+        {
+            value += f((float) (dx * i + a));
+        }
+#pragma omp critical
+        {
+            res+= value;
+        }
+    }
+    return (float) (res * dx);
+}
+
+float integrate_omp_reduce(float a, float b, f_t f)
+{
+    double res = 0.0;
+    double dx = (b - a) / n;
+    int i;
+#pragma omp parallel for reduction(+: res) schedule(static)
+    for (i = 0; i < n; ++i)
+        res += f((float) (dx * i + a));
+    return (float) (res * dx);
+}
+
+float integrate_omp_reduce_dynamic(float a, float b, f_t f) // какой поток свободен, тот и будет работать
+{
+    double res = 0.0;
+    double dx = (b - a) / n;
+    int i;
+#pragma omp parallel for reduction(+: res) schedule(dynamic)
+    for (i = 0; i < n; ++i)
+        res += f((float) (dx * i + a));
+    return (float) (res * dx);
+}
+
+float integrate_mtx(float a, float b, f_t f)
+{
+    double res = 0.0;
+    double dx = (b - a) / n;
+    omp_lock_t mtx;
+    omp_init_lock(&mtx);
+#pragma omp parallel shared(res)
+    {
+        unsigned t = (unsigned) omp_get_thread_num();
+        unsigned T = (unsigned) omp_get_num_threads();
+        double val = 0.0;
+        for(size_t i = t; i < n; i+=T) {
+            val += f(a + i * dx);
+        }
+        omp_set_lock(&mtx);
+        res += val;
+        omp_unset_lock(&mtx);
+    }
+    return res * dx;
+}
+
+float integrate_omp_atomic(float a, float b, f_t f) // более выгоден для атомарных операций
+{
+    double res = 0.0;
+    double dx = (b - a) / n;
+#pragma omp parallel shared(res)
+    {
+        unsigned t = (unsigned) omp_get_thread_num();
+        unsigned T = (unsigned) omp_get_num_threads();
+        double val = 0.0;
+        for (size_t i = t; i < n; i += T)
+        {
+            val += f((float) (dx * i + a));
+        }
+#pragma omp atomic
+        res += val;
+    }
+    return (float) (res * dx);
+}
+
+float integrate_cpp(float a, float b, f_t f){
     double dx = (b - a) / n;
     unsigned T = get_num_threads();
     std::vector results(T, element_t{ 0.0 });
@@ -79,8 +212,7 @@ float integrate_cpp(float a, float b, f_t f)
     return (float)(res * dx);
 }
 
-float integrate_cpp_cs(float a, float b, f_t f)
-{
+float integrate_cpp_cs(float a, float b, f_t f){
     double res = 0.0;
     double dx = (b - a) / n;
     unsigned T = get_num_threads();
@@ -123,20 +255,22 @@ float integrate_cpp_atomic(float a, float b, f_t f) //C++20
     return res * dx;
 }
 
+#include <iterator>
+
 class Iterator
 {
     f_t f;
     double dx, a;
     unsigned i = 0;
 public:
-    typedef double value_type, * pointer, & reference;
+    typedef double value_type, *pointer, &reference;
     using iterator_category = std::input_iterator_tag;
     //Iterator() = default;
-    Iterator(f_t fun, double delta_x, double x0, unsigned index) :f(fun), dx(delta_x), a(x0), i(index) {}
-    [[nodiscard]] double value() const {
+    Iterator(f_t fun, double delta_x, double x0, unsigned index):f(fun), dx(delta_x), a(x0), i(index) {}
+    double value() const{
         return f(a + i * dx);
     }
-    auto operator*() const { return this->value(); }
+    auto operator*() const {return this->value();}
     Iterator& operator++()
     {
         ++i;
@@ -145,7 +279,7 @@ public:
     Iterator operator++(int)
     {
         auto old = *this;
-        ++* this;
+        ++*this;
         return old;
     }
     bool operator==(const Iterator& other) const
@@ -154,39 +288,23 @@ public:
     }
 };
 
-#include <numeric>
-
-float integrate_cpp_reduce_1(float a, float b, f_t f)
-{
-#ifdef __GNUC__
-    return 0.0;
-#else
-    double dx = (b - a) / n;
-    return std::reduce(Iterator(f, dx, a, 0), Iterator(f, dx, a, n)) * dx;
-#endif
-}
-
 #include "reduce_par.h"
-float integrate_cpp_reduce_2(float a, float b, f_t f)
-{
+float integrate_cpp_reduce_2(float a, float b, f_t f) {
     double dx = (b - a) / n;
     return reduce_par_2([f, dx](double x, double y) {return x + y; }, f, (double)a, (double)b, (double)dx, 0.0) * dx;
 }
 
-float g(float x)
-{
+float g(float x) {
     return x * x;
 }
 
-typedef struct experiment_result_t_
-{
+typedef struct experiment_result_t_ {
     float result;
     double time;
 } experiment_result_t;
 
 typedef float (*integrate_t)(float a, float b, f_t f);
-experiment_result_t run_experiment(integrate_t integrate)
-{
+experiment_result_t run_experiment(integrate_t integrate) {
     experiment_result_t result;
     double t0 = omp_get_wtime();
     result.result = integrate(-1, 1, g);
@@ -194,18 +312,15 @@ experiment_result_t run_experiment(integrate_t integrate)
     return result;
 }
 
-void run_experiments(experiment_result_t* results, float (*I) (float, float, f_t))
-{
-    for (unsigned T = 1; T <= std::thread::hardware_concurrency(); ++T)
-    {
+void run_experiments(experiment_result_t* results, float (*I) (float, float, f_t)) {
+    for (unsigned T = 1; T <= std::thread::hardware_concurrency(); ++T) {
         set_num_threads(T);
         results[T - 1] = run_experiment(I);
     }
 }
 
 #include <iomanip>
-void show_results_for(const char* name, const experiment_result_t* results)
-{
+void show_results_for(const char* name, const experiment_result_t* results) {
     unsigned w = 10;
     std::cout << name << "\n";
     std::cout << std::setw(w) << "T" << "\t"
@@ -219,36 +334,37 @@ void show_results_for(const char* name, const experiment_result_t* results)
                   << std::setw(w) << results[0].time / results[T - 1].time << "\n";
 };
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv) {
 
-    //freopen("output.txt", "w", stdout);
+    experiment_result_t* results = (experiment_result_t*)malloc(get_num_threads() * sizeof(experiment_result_t));
 
-    auto* results = (experiment_result_t*)malloc(get_num_threads() * sizeof(experiment_result_t));
+    run_experiments(results, integrate_seq);
+    show_results_for("integrate_seq", results);
+    run_experiments(results, integrate_omp_fs);
+    show_results_for("integrate_omp_fs", results);
     run_experiments(results, integrate_omp);
     show_results_for("integrate_omp", results);
+    run_experiments(results, integrate_omp_cs);
+    show_results_for("integrate_omp_cs", results);
+    run_experiments(results, integrate_mtx);
+    show_results_for("integrate_mtx", results);
+    run_experiments(results, integrate_omp_atomic);
+    show_results_for("integrate_omp_atomic", results);
+    run_experiments(results, integrate_omp_reduce);
+    show_results_for("integrate_omp_reduce", results);
+    run_experiments(results, integrate_omp_reduce_dynamic);
+    show_results_for("integrate_omp_reduce_dynamic", results);
+
     run_experiments(results, integrate_cpp);
     show_results_for("integrate_cpp", results);
     run_experiments(results, integrate_cpp_cs);
     show_results_for("integrate_cpp_cs", results);
     run_experiments(results, integrate_cpp_atomic);
     show_results_for("integrate_cpp_atomic", results);
-    run_experiments(results, integrate_cpp_reduce_1);
-    show_results_for("integrate_cpp_reduce_1", results);
     run_experiments(results, integrate_cpp_reduce_2);
     show_results_for("integrate_cpp_reduce_2", results);
     free(results);
     experiment_result_t r;
-    r = run_experiment(integrate_omp);
-    printf("integrate_omp. Result: %g. Time: %g\n", (double) r.result, r.time);
-    r = run_experiment(integrate_cpp);
-    printf("integrate_cpp. Result: %g. Time: %g\n", (double) r.result, r.time);
-    r = run_experiment(integrate_cpp_cs);
-    printf("integrate_cpp_cs. Result: %g. Time: %g\n", (double) r.result, r.time);
-    r = run_experiment(integrate_cpp_atomic);
-    printf("integrate_cpp_atomic. Result: %g. Time: %g\n", (double) r.result, r.time);
-    r = run_experiment(integrate_cpp_reduce_2);
-    printf("integrate_cpp_reduce_2. Result: %g. Time: %g\n", (double) r.result, r.time);
 
     return 0;
 }
